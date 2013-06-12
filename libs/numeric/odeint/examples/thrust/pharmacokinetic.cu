@@ -16,10 +16,74 @@ using namespace std;
 using namespace boost::numeric::odeint;
 
 // change to float if your GPU does not support doubles
-typedef double value_type;
+//typedef double value_type;
+typedef float value_type;
 typedef thrust::device_vector< value_type > state_type;
 typedef runge_kutta4< state_type , value_type , state_type , value_type > stepper_type;
 
+struct mean_field_calculator
+{
+    struct sin_functor : public thrust::unary_function< value_type , value_type >
+    {
+        __host__ __device__
+        value_type operator()( value_type x) const
+        {
+            //return sin( x );
+            return x ;
+        }
+    };
+
+    struct cos_functor : public thrust::unary_function< value_type , value_type >
+    {
+        __host__ __device__
+        value_type operator()( value_type x) const
+        {
+            //return cos( x );
+            return x ;
+        }
+    };
+
+    static std::pair< value_type , value_type > get_mean( const state_type &x )
+    {
+        //[ thrust_phase_ensemble_sin_sum
+        value_type sin_sum = thrust::reduce(
+                thrust::make_transform_iterator( x.begin() , sin_functor() ) ,
+                thrust::make_transform_iterator( x.end() , sin_functor() ) );
+        //]
+        value_type cos_sum = thrust::reduce(
+                thrust::make_transform_iterator( x.begin() , cos_functor() ) ,
+                thrust::make_transform_iterator( x.end() , cos_functor() ) );
+
+        cos_sum /= value_type( x.size() );
+        sin_sum /= value_type( x.size() );
+
+        value_type K = sqrt( cos_sum * cos_sum + sin_sum * sin_sum );
+        value_type Theta = atan2( sin_sum , cos_sum );
+
+        return std::make_pair( K , Theta );
+    }
+};
+// FIXME need FFT observer
+struct statistics_observer
+{
+    value_type m_K_mean;
+    size_t m_count;
+
+    statistics_observer( void )
+    : m_K_mean( 0.0 ) , m_count( 0 ) { }
+
+    template< class State >
+    void operator()( const State &x , value_type t )
+    {
+        std::pair< value_type , value_type > mean = mean_field_calculator::get_mean( x );
+        m_K_mean += mean.first;
+        ++m_count;
+    }
+
+    value_type get_K_mean( void ) const { return ( m_count != 0 ) ? m_K_mean / value_type( m_count ) : 0.0 ; }
+
+    void reset( void ) { m_K_mean = 0.0; m_count = 0; }
+};
 struct relaxation
 {
     struct relaxation_functor
@@ -193,11 +257,15 @@ int main( int argc , char* argv[] )
     thrust::fill( x.begin()              , x.begin() + 1 * Nsize , 10.0 );
     thrust::fill( x.begin() + 1 * Nsize  , x.end()               , 1.0 );
 
+    // initialize observer
+    statistics_observer obs;
+
     // integrate
     cout << " integrate " << endl;
     relaxation relax( Nsize , alpha, beta, gamma );
-    integrate_const( stepper_type() , boost::ref( relax ) , x , start_time , final_time , dt );
-
+    integrate_const( stepper_type() , boost::ref( relax ) , x , start_time , final_time , dt, boost::ref( obs ) );
+    cout << "count " << obs.m_count << " mean \t" << obs.get_K_mean() << endl;
+    
     // write final state
     //thrust::copy( x.begin() , x.end() , std::ostream_iterator< value_type >( std::cout , "\n" ) );
     //std::cout << std::endl;
